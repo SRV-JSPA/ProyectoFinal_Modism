@@ -52,46 +52,206 @@ class ResultadosMonteCarlo:
     def __init__(self, config: ConfiguracionMonteCarlo, parametros: ParametrosFinancieros):
         self.config = config
         self.parametros = parametros
-        
-        
         self.precios_simulados = None  
         self.shocks_temporales = None  
         self.eventos_contagio = None   
         self.metricas_riesgo = None    
         self.matriz_contagio = None    
-        
-        
         self.timestamp = datetime.now().isoformat()
     
     def get_datos_componente_2(self) -> Dict:
+        import numpy as np
+        import math
+
         if self.precios_simulados is None:
             raise ValueError("Debe ejecutar simulación primero")
-        
-        umbral_correlacion = 0.3
-        matriz_adyacencia = (np.abs(self.parametros.matriz_correlacion) > umbral_correlacion).astype(int)
-        np.fill_diagonal(matriz_adyacencia, 0)
-        
-        
-        rendimientos = np.diff(np.log(self.precios_simulados), axis=1)
-        vol_realizada = np.std(rendimientos, axis=(0,1))
-        centralidad_volatilidad = vol_realizada / np.max(vol_realizada)
-        
-        
-        centralidad_contagio = np.sum(self.matriz_contagio, axis=1)
-        
+
+        precios = self.precios_simulados
+        logret = np.diff(np.log(precios), axis=1)
+        R = logret.reshape(-1, logret.shape[-1])
+        corr = np.corrcoef(R, rowvar=False)
+        N = corr.shape[0]
+        nombres = list(self.config.activos)
+
+        corr = np.nan_to_num(corr, nan=0.0, posinf=0.0, neginf=0.0)
+        np.fill_diagonal(corr, 0.0)
+
+        W = np.abs(corr)
+        w_dis = 1.0 - W
+        adj_emp = np.zeros((N, N), dtype=int)
+        in_tree = np.zeros(N, dtype=bool)
+        in_tree[0] = True
+        for _ in range(N - 1):
+            best_i = -1
+            best_j = -1
+            best_w = math.inf
+            for i in range(N):
+                if not in_tree[i]:
+                    continue
+                for j in range(N):
+                    if in_tree[j] or i == j:
+                        continue
+                    ww = w_dis[i, j]
+                    if ww < best_w:
+                        best_w = ww
+                        best_i = i
+                        best_j = j
+            adj_emp[best_i, best_j] = 1
+            adj_emp[best_j, best_i] = 1
+            in_tree[best_j] = True
+
+        k_target = max(2, int(round(np.sqrt(N))))
+        M_target = int(N * k_target / 2)
+
+        Iu, Ju = np.triu_indices(N, k=1)
+        strengths = W[Iu, Ju]
+        order = np.argsort(-strengths)
+        edges_added = int(adj_emp.sum() // 2)
+        for idx in order:
+            if edges_added >= M_target:
+                break
+            i, j = Iu[idx], Ju[idx]
+            if adj_emp[i, j] == 1:
+                continue
+            adj_emp[i, j] = 1
+            adj_emp[j, i] = 1
+            edges_added += 1
+
+        W_emp = W * adj_emp
+
+        grado_emp = adj_emp.sum(axis=1)
+        m_ba = max(1, int(round(grado_emp.mean() / 2.0)))
+        seed = int(self.config.semilla_aleatoria or 42)
+
+        def ba_graph(n, m, seed_val):
+            rng = np.random.default_rng(seed_val)
+            deg = np.zeros(n, dtype=int)
+            edges = set()
+            for u in range(m):
+                for v in range(u + 1, m):
+                    edges.add((u, v))
+                    deg[u] += 1
+                    deg[v] += 1
+            repeated = []
+            for u in range(m):
+                repeated.extend([u] * deg[u])
+            for new in range(m, n):
+                chosen = set()
+                while len(chosen) < m and len(repeated) > 0:
+                    chosen.add(int(rng.choice(repeated)))
+                if len(chosen) < m:
+                    pool = list(range(new))
+                    while len(chosen) < m:
+                        chosen.add(int(rng.choice(pool)))
+                for t in chosen:
+                    u, v = (new, t) if new < t else (t, new)
+                    if (u, v) not in edges:
+                        edges.add((u, v))
+                        deg[new] += 1
+                        deg[t] += 1
+                repeated.extend(list(chosen))
+                repeated.extend([new] * deg[new])
+            adj = np.zeros((n, n), dtype=int)
+            for (u, v) in edges:
+                adj[u, v] = 1
+                adj[v, u] = 1
+            return adj, sorted(list(edges))
+
+        adj_ba, edges_ba = ba_graph(N, m_ba, seed)
+
+        def degree(A):
+            return A.sum(axis=1)
+
+        def clustering(A):
+            k = degree(A)
+            A3 = A @ A @ A
+            tri_i = np.diag(A3) / 2.0
+            denom = k * (k - 1) / 2.0
+            with np.errstate(divide='ignore', invalid='ignore'):
+                c_i = np.where(denom > 0, tri_i / denom, 0.0)
+            return float(np.nanmean(c_i)), c_i
+
+        def assortativity(A):
+            k = degree(A)
+            iu, ju = np.triu_indices(A.shape[0], k=1)
+            mask = A[iu, ju] == 1
+            di, dj = k[iu][mask], k[ju][mask]
+            if di.size == 0:
+                return 0.0
+            return float(np.corrcoef(di, dj)[0, 1])
+
+        def eigenvector_centrality(A, iters=1000, tol=1e-9):
+            v = np.ones(A.shape[0], dtype=float)
+            v /= np.linalg.norm(v)
+            for _ in range(iters):
+                v_new = A @ v
+                norm = np.linalg.norm(v_new)
+                if norm == 0:
+                    break
+                v_new /= norm
+                if np.linalg.norm(v_new - v) < tol:
+                    v = v_new
+                    break
+                v = v_new
+            return v
+
+        k_emp = degree(adj_emp)
+        k_ba = degree(adj_ba)
+        c_emp_avg, c_emp = clustering(adj_emp)
+        c_ba_avg, c_ba = clustering(adj_ba)
+        r_emp = assortativity(adj_emp)
+        r_ba = assortativity(adj_ba)
+        ev_emp = eigenvector_centrality(adj_emp)
+        ev_ba = eigenvector_centrality(adj_ba)
+
+        top_emp_idx = np.argsort(-k_emp)[:5]
+        top_ba_idx = np.argsort(-k_ba)[:5]
+        hubs_emp = [{'activo': nombres[i], 'grado': int(k_emp[i]), 'eigencentralidad': float(ev_emp[i])} for i in top_emp_idx]
+        hubs_ba = [{'activo': nombres[i], 'grado': int(k_ba[i]), 'eigencentralidad': float(ev_ba[i])} for i in top_ba_idx]
+
+        edges_emp = []
+        iu, ju = np.triu_indices(N, k=1)
+        for i, j in zip(iu, ju):
+            if adj_emp[i, j] == 1:
+                edges_emp.append({'source': int(i), 'target': int(j), 'peso': float(W_emp[i, j])})
+
+        sigma = np.std(R, axis=0, ddof=1)
+
+        def _minmax(x):
+            x = np.asarray(x, dtype=float)
+            mn, mx = np.min(x), np.max(x)
+            if mx == mn:
+                return np.zeros_like(x)
+            return (x - mn) / (mx - mn)
+
+        cv_vec = _minmax(ev_emp) * _minmax(sigma)
+        rank_idx = np.argsort(-cv_vec)
+        centralidad_vol_list = [{'activo': nombres[i], 'valor': float(cv_vec[i]), 'grado': int(k_emp[i]), 'eigencentralidad': float(ev_emp[i]), 'volatilidad': float(sigma[i])} for i in rank_idx]
+
         return {
-            'activos': self.config.activos,
-            'matriz_correlacion': self.parametros.matriz_correlacion,
-            'matriz_adyacencia': matriz_adyacencia,
-            'pesos_aristas': np.abs(self.parametros.matriz_correlacion) * matriz_adyacencia,
-            'centralidad_volatilidad': centralidad_volatilidad,
-            'centralidad_contagio': centralidad_contagio,
-            'parametros_barabasi_albert': {
-                'n_nodos': len(self.config.activos),
-                'm_conexiones': max(1, int(np.sum(matriz_adyacencia) / len(self.config.activos) / 2)),
-                'seed': self.config.semilla_aleatoria
-            }
-        }
+            'activos': nombres,
+            'matriz_correlacion': corr,
+            'adj_empirica': adj_emp.astype(int),
+            'W_empirica': W_emp,
+            'edges_empiricos': edges_emp,
+            'ba_params': {'n_nodos': int(N), 'm': int(m_ba), 'seed': seed},
+            'adj_ba': adj_ba.astype(int),
+            'edges_ba': [{'source': int(u), 'target': int(v)} for (u, v) in edges_ba],
+            'metrics': {
+                'avg_degree_emp': float(k_emp.mean()),
+                'avg_clustering_emp': c_emp_avg,
+                'assortativity_emp': r_emp,
+                'avg_degree_ba': float(k_ba.mean()),
+                'avg_clustering_ba': c_ba_avg,
+                'assortativity_ba': r_ba
+            },
+            'hubs_empiricos': hubs_emp,
+            'hubs_ba': hubs_ba,
+            'centralidad_volatilidad': cv_vec,
+            'centralidad_volatilidad_por_activo': centralidad_vol_list
+    }
+
+
     
     def get_datos_componente_3(self) -> Dict:
         if self.shocks_temporales is None:
