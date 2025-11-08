@@ -251,47 +251,200 @@ class ResultadosMonteCarlo:
             'centralidad_volatilidad_por_activo': centralidad_vol_list
     }
 
+    def ejecutar_modelo_SIR(self,
+                            beta: float = None,
+                            gamma: float = 0.10,
+                            umbral_infeccion: float = None,
+                            pasos: Optional[int] = None,
+                            red: str = 'contagio',
+                            usar_empirica_con_pesos: bool = True,
+                            semilla: Optional[int] = None) -> Dict:
+        import numpy as np
+        if self.precios_simulados is None or self.shocks_temporales is None:
+            raise ValueError("Debe ejecutar simulación primero (precios y shocks).")
+        rng = np.random.default_rng(self.config.semilla_aleatoria if semilla is None else semilla)
+        beta = beta if beta is not None else float(self.config.intensidad_contagio)
+        umbral = umbral_infeccion if umbral_infeccion is not None else float(self.config.umbral_shock)
+        N = len(self.config.activos)
+        T = pasos if pasos is not None else self.shocks_temporales.shape[1]
+
+        # --- Matriz de pesos W ---
+        if red == 'contagio':
+            if self.matriz_contagio is None:
+                raise ValueError("self.matriz_contagio no está definida.")
+            W = np.array(self.matriz_contagio, dtype=float)
+        elif red == 'empirica':
+            datos2 = self.get_datos_componente_2()
+            adj = np.array(datos2['adj_empirica'], dtype=int)
+            if usar_empirica_con_pesos:
+                W_emp = np.array(datos2['W_empirica'], dtype=float)
+                W = W_emp / (W_emp.sum(axis=1, keepdims=True) + 1e-12)
+            else:
+                row_sums = adj.sum(axis=1, keepdims=True)
+                row_sums[row_sums == 0] = 1
+                W = adj / row_sums
+        else:
+            raise ValueError("red debe ser 'contagio' o 'empirica'.")
+
+        # --- Estados S/I/R ---
+        S = np.ones((T, N), dtype=bool)
+        I = np.zeros((T, N), dtype=bool)
+        R = np.zeros((T, N), dtype=bool)
+
+        centralidad_vol = self.get_datos_componente_2()['centralidad_volatilidad']
+        thr0 = np.percentile(centralidad_vol, 80)
+        I0 = (centralidad_vol > thr0)
+        I[0, :] = I0
+        S[0, :] = ~I0
+
+        transmisiones = []
+        secundarios_por_src = np.zeros(N, dtype=int)
+
+        for t in range(1, T):
+            S_prev, I_prev, R_prev = S[t-1, :].copy(), I[t-1, :].copy(), R[t-1, :].copy()
+
+            # Recuperación
+            rec = (rng.random(N) < gamma) & I_prev
+            I_now = I_prev & (~rec)
+            R_now = R_prev | rec
+
+            # Infección por red
+            if I_prev.any():
+                p_ij = 1.0 - np.exp(-beta * W)
+                inf_sources = np.where(I_prev)[0]
+                sus = np.where(S_prev)[0]
+                new_inf = np.zeros(N, dtype=bool)
+                parent_candidates = {j: [] for j in sus}
+                for i in inf_sources:
+                    pij_row = p_ij[i, sus]
+                    hits = rng.random(len(sus)) < pij_row
+                    for idx_local, hit in enumerate(hits):
+                        if hit:
+                            j = sus[idx_local]
+                            parent_candidates[j].append(i)
+                for j in sus:
+                    if parent_candidates[j]:
+                        new_inf[j] = True
+                        src = rng.choice(parent_candidates[j])
+                        transmisiones.append((t, int(src), int(j)))
+                        secundarios_por_src[src] += 1
+            else:
+                new_inf = np.zeros(N, dtype=bool)
+
+            shocks_t = self.shocks_temporales[:, t-1, :]  
+            max_abs = np.max(np.abs(shocks_t), axis=0)
+            exog = max_abs > umbral
+            new_inf |= (exog & S_prev)
+
+            # Actualiza
+            I_now |= new_inf
+            S_now = S_prev & (~new_inf)
+            S[t, :], I[t, :], R[t, :] = S_now, I_now, R_now
+
+        I_count = I.sum(axis=1)
+        new_cases = np.zeros(T, dtype=int)
+        new_cases[0] = I[0, :].sum()
+        new_cases[1:] = np.maximum(0, (I[1:, :].sum(axis=1) - I[:-1, :].sum(axis=1)))
+        eps = 1e-9
+        Rt = (new_cases[1:] / (I_count[:-1] + eps))
+        if len(Rt) >= 7:
+            from numpy.lib.stride_tricks import sliding_window_view
+            w = min(7, len(Rt))
+            Rt_suave = sliding_window_view(Rt, w).mean(axis=-1)
+            Rt_plot = np.concatenate([Rt[:w-1], Rt_suave])
+        else:
+            Rt_plot = Rt
+
+        orden = np.argsort(-secundarios_por_src)
+        hubs = [{'activo': self.config.activos[i],
+                'infecciones_secundarias': int(secundarios_por_src[i])}
+                for i in orden if secundarios_por_src[i] > 0]
+
+        resultados_sir = {
+            'S': S, 'I': I, 'R': R,
+            'nuevos_casos': new_cases,
+            'infectados_totales_t': I_count,
+            'Rt': Rt_plot,
+            'transmisiones': transmisiones,
+            'superpropagadores': hubs,
+            'parametros': {'beta': beta, 'gamma': gamma, 'umbral': umbral, 'red': red},
+        }
+        self.datos_sir = resultados_sir
+        return resultados_sir
+
+    def graficar_SIR(self):
+        import matplotlib.pyplot as plt
+        if not hasattr(self, 'datos_sir'):
+            print("Primero ejecuta ejecutar_modelo_SIR().")
+            return
+        S = self.datos_sir['S'].sum(axis=1)
+        I = self.datos_sir['I'].sum(axis=1)
+        R = self.datos_sir['R'].sum(axis=1)
+        Rt = self.datos_sir['Rt']
+
+        fig, ax = plt.subplots(figsize=(10,5))
+        ax.plot(S, label='S', linewidth=2)
+        ax.plot(I, label='I', linewidth=2)
+        ax.plot(R, label='R', linewidth=2)
+        ax.set_title('Dinámica SIR (número de activos por estado)')
+        ax.set_xlabel('Tiempo (pasos)')
+        ax.set_ylabel('# Activos')
+        ax.grid(True, alpha=0.3)
+        ax.legend(loc='best')
+        plt.show()
+
+        fig2, ax2 = plt.subplots(figsize=(10,4))
+        ax2.plot(Rt, linewidth=2)
+        ax2.axhline(1.0, linestyle='--')
+        ax2.set_title('Rt (estimado)')
+        ax2.set_xlabel('Tiempo (pasos)')
+        ax2.set_ylabel('Rt')
+        ax2.grid(True, alpha=0.3)
+        plt.show()
 
     
     def get_datos_componente_3(self) -> Dict:
         if self.shocks_temporales is None:
             raise ValueError("Debe ejecutar simulación primero")
-        
-        
+
+        # Estados iniciales y superpropagadores 
         centralidad_vol = self.get_datos_componente_2()['centralidad_volatilidad']
         umbral_inicial = np.percentile(centralidad_vol, 80)
-        
         susceptibles = (centralidad_vol <= umbral_inicial).astype(float)
         infectados = (centralidad_vol > umbral_inicial).astype(float)
         recuperados = np.zeros(len(self.config.activos))
-        
-        
+
         contador_origen = {}
         for evento in self.eventos_contagio:
             for activo_idx in evento['activos_origen']:
                 activo = self.config.activos[activo_idx]
                 contador_origen[activo] = contador_origen.get(activo, 0) + 1
-        
         activos_ordenados = sorted(contador_origen.items(), key=lambda x: x[1], reverse=True)
         n_super = max(1, len(activos_ordenados) // 5)
-        superpropagadores = [activo for activo, _ in activos_ordenados[:n_super]]
-        
+        superpropagadores_pre = [activo for activo, _ in activos_ordenados[:n_super]]
+
+        sir = self.ejecutar_modelo_SIR(
+            beta=self.config.intensidad_contagio,
+            gamma=0.10,
+            umbral_infeccion=self.config.umbral_shock,
+            red='contagio'  
+        )
+
         return {
             'shocks_temporales': self.shocks_temporales,
             'eventos_contagio': self.eventos_contagio,
             'matriz_transmision': self.matriz_contagio,
-            'estados_sir_iniciales': {
-                'S': susceptibles,
-                'I': infectados,
-                'R': recuperados
-            },
-            'superpropagadores': superpropagadores,
+            'estados_sir_iniciales': {'S': susceptibles, 'I': infectados, 'R': recuperados},
+            'superpropagadores_previos': superpropagadores_pre,       
+            'sir_resultados': sir,                                    
             'parametros_sir': {
-                'beta': self.config.intensidad_contagio,
-                'gamma': 0.1,  
-                'umbral_infeccion': self.config.umbral_shock
+                'beta': sir['parametros']['beta'],
+                'gamma': sir['parametros']['gamma'],
+                'umbral_infeccion': sir['parametros']['umbral'],
+                'red': sir['parametros']['red']
             }
         }
+
     
     def get_datos_componente_4(self) -> Dict:
         if self.precios_simulados is None:
