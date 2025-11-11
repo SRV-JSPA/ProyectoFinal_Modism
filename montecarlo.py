@@ -18,7 +18,7 @@ warnings.filterwarnings('ignore')
 class ConfiguracionMonteCarlo:
     activos: List[str]
     n_simulaciones: int = 1000
-    n_pasos: int = 252  # Por ejemplo, 252 días de trading
+    n_pasos: int = 252  
     tiempo_anos: float = 1.0
     intensidad_contagio: float = 0.15
     umbral_shock: float = 2.0  # Shocks mayores a este valor se consideran "extremos"
