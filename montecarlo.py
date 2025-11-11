@@ -18,10 +18,10 @@ warnings.filterwarnings('ignore')
 class ConfiguracionMonteCarlo:
     activos: List[str]
     n_simulaciones: int = 1000
-    n_pasos: int = 252  
+    n_pasos: int = 252  # Por ejemplo, 252 días de trading
     tiempo_anos: float = 1.0
     intensidad_contagio: float = 0.15
-    umbral_shock: float = 2.0  
+    umbral_shock: float = 2.0  # Shocks mayores a este valor se consideran "extremos"
     semilla_aleatoria: Optional[int] = 42
     incluir_contagio: bool = True
 
@@ -38,13 +38,14 @@ class ParametrosFinancieros:
         assert len(self.volatilidades) == n
         assert self.matriz_correlacion.shape == (n, n)
         
-        
+        # Asegurar que la matriz de correlación sea semidefinida positiva
         eigenvals = np.linalg.eigvals(self.matriz_correlacion)
         if not np.all(eigenvals >= -1e-8):
+            # Ajuste simple: subir eigenvalores negativos a un mínimo pequeño
             eigenvals = np.maximum(eigenvals, 0.01)
             eigenvecs = np.linalg.eigh(self.matriz_correlacion)[1]
             self.matriz_correlacion = eigenvecs @ np.diag(eigenvals) @ eigenvecs.T
-            
+            # Re-normalizar para que la diagonal sea 1
             D = np.sqrt(np.diag(self.matriz_correlacion))
             self.matriz_correlacion = self.matriz_correlacion / np.outer(D, D)
 
@@ -249,7 +250,7 @@ class ResultadosMonteCarlo:
             'hubs_ba': hubs_ba,
             'centralidad_volatilidad': cv_vec,
             'centralidad_volatilidad_por_activo': centralidad_vol_list
-    }
+        }
 
     def ejecutar_modelo_SIR(self,
                             beta: float = None,
@@ -427,7 +428,7 @@ class ResultadosMonteCarlo:
             beta=self.config.intensidad_contagio,
             gamma=0.10,
             umbral_infeccion=self.config.umbral_shock,
-            red='contagio'  
+            red='contagio'  # Usamos la misma red de matriz_contagio
         )
 
         return {
@@ -435,8 +436,8 @@ class ResultadosMonteCarlo:
             'eventos_contagio': self.eventos_contagio,
             'matriz_transmision': self.matriz_contagio,
             'estados_sir_iniciales': {'S': susceptibles, 'I': infectados, 'R': recuperados},
-            'superpropagadores_previos': superpropagadores_pre,       
-            'sir_resultados': sir,                                    
+            'superpropagadores_previos': superpropagadores_pre,       # top según eventos de contagio
+            'sir_resultados': sir,                                    # trayectoria SIR completa
             'parametros_sir': {
                 'beta': sir['parametros']['beta'],
                 'gamma': sir['parametros']['gamma'],
@@ -450,18 +451,18 @@ class ResultadosMonteCarlo:
         if self.precios_simulados is None:
             raise ValueError("Debe ejecutar simulación primero")
         
-        
+        # 1) Promedio de precios simulados a través de las simulaciones
         precios_promedio = np.mean(self.precios_simulados, axis=0)
         
-        
+        # 2) Construimos índice temporal
         timestamps = pd.date_range(start='2024-01-01', periods=len(precios_promedio), freq='D')
         df_precios = pd.DataFrame(precios_promedio, index=timestamps, columns=self.config.activos)
         
-        
+        # 3) Rendimientos y volatilidad simple
         df_rendimientos = df_precios.pct_change().fillna(0)
         df_volatilidad = df_rendimientos.rolling(21).std().fillna(0)
         
-        
+        # 4) Volatilidades realizadas con distintas ventanas
         ventanas = [5, 10, 21, 63]
         vol_realizadas_dict = {}
         for ventana in ventanas:
@@ -470,7 +471,7 @@ class ResultadosMonteCarlo:
         
         df_vol_realizadas = pd.DataFrame(vol_realizadas_dict, index=timestamps)
         
-        
+        # 5) Definimos regímenes de mercado a partir de la volatilidad promedio
         vol_promedio = df_vol_realizadas.mean(axis=1)
         umbrales = [np.percentile(vol_promedio.dropna(), p) for p in [25, 75, 95]]
         
@@ -487,7 +488,7 @@ class ResultadosMonteCarlo:
             else:
                 regimenes.append('Crisis')
         
-        
+        # 6) Features para modelos de ML / Deep Learning
         features_ml = self._calcular_features_ml(df_precios, df_rendimientos)
         
         return {
@@ -518,21 +519,21 @@ class ResultadosMonteCarlo:
     def _calcular_features_ml(self, precios: pd.DataFrame, rendimientos: pd.DataFrame) -> pd.DataFrame:
         features = {}
         
-        
+        # 1) RSI promedio (sobre todos los activos)
         features['rsi_promedio'] = self._calcular_rsi(precios).mean(axis=1)
         
-        
+        # 2) Relación de medias móviles (momentum)
         ma_5 = precios.rolling(5).mean().mean(axis=1)
         ma_21 = precios.rolling(21).mean().mean(axis=1)
         features['ma_ratio'] = ma_5 / ma_21
         
-        
+        # 3) Correlación promedio rolling entre activos
         features['correlacion_promedio'] = self._correlacion_rolling(rendimientos)
         
-        
+        # 4) Dispersión cross-sectional de rendimientos
         features['dispersion'] = rendimientos.std(axis=1)
         
-        
+        # 5) Momentums a distintas ventanas
         features['momentum_5d'] = (precios / precios.shift(5) - 1).mean(axis=1)
         features['momentum_21d'] = (precios / precios.shift(21) - 1).mean(axis=1)
         
@@ -568,7 +569,7 @@ class ResultadosMonteCarlo:
         ruta_completa = os.path.join(directorio, f"componente_1_resultados_{timestamp}")
         os.makedirs(ruta_completa, exist_ok=True)
         
-        
+        # 1) Guardar configuración y parámetros
         config_data = {
             'configuracion': asdict(self.config),
             'parametros': {
@@ -584,7 +585,7 @@ class ResultadosMonteCarlo:
         with open(os.path.join(ruta_completa, 'configuracion.json'), 'w') as f:
             json.dump(config_data, f, indent=2)
         
-        
+        # 2) Guardar simulaciones crudas
         datos_simulacion = {
             'precios_simulados': self.precios_simulados,
             'shocks_temporales': self.shocks_temporales,
@@ -595,7 +596,7 @@ class ResultadosMonteCarlo:
         with open(os.path.join(ruta_completa, 'datos_simulacion.pkl'), 'wb') as f:
             pickle.dump(datos_simulacion, f)
         
-        
+        # 3) Guardar datos de componentes 2, 3 y 4
         for i, metodo in enumerate([self.get_datos_componente_2, self.get_datos_componente_3, self.get_datos_componente_4], 2):
             try:
                 datos = metodo()
@@ -605,7 +606,6 @@ class ResultadosMonteCarlo:
                 print(f"Error guardando datos componente {i}: {e}")
         
         return ruta_completa
-
 
 
 
@@ -622,22 +622,22 @@ class SimuladorMonteCarlo:
     
     def crear_datos_ejemplo(self) -> Tuple[ConfiguracionMonteCarlo, ParametrosFinancieros]:        
         activos = [
-            'SPY', 'QQQ', 'IWM', 'VTI', 'GLD',      
-            'AAPL', 'MSFT', 'GOOGL', 'AMZN', 'TSLA', 
-            'JPM', 'BAC', 'WFC', 'GS', 'MS',         
-            'JNJ', 'PFE', 'UNH', 'ABBV', 'MRK',     
-            'XOM', 'CVX', 'COP', 'SLB', 'EOG'       
+            'SPY', 'QQQ', 'IWM', 'VTI', 'GLD',      # ETFs diversificados
+            'AAPL', 'MSFT', 'GOOGL', 'AMZN', 'TSLA', # Tech / Growth
+            'JPM', 'BAC', 'WFC', 'GS', 'MS',         # Bancos
+            'JNJ', 'PFE', 'UNH', 'ABBV', 'MRK',      # Salud
+            'XOM', 'CVX', 'COP', 'SLB', 'EOG'        # Energía
         ]
         
         n_activos = len(activos)
         np.random.seed(42)
         
-        
+        # Precios iniciales "realistas"
         precios_iniciales = np.random.uniform(50, 500, n_activos)
         rendimientos_esperados = np.random.uniform(-0.05, 0.15, n_activos)
         volatilidades = np.random.uniform(0.15, 0.60, n_activos)
         
-        
+        # Matriz de correlación base (bloques sectoriales)
         correlacion = np.eye(n_activos)
         
         sectores = {
@@ -648,31 +648,31 @@ class SimuladorMonteCarlo:
             'Energía': range(20, 25)
         }
         
-        
+        # Correlaciones altas dentro de cada sector
         for indices in sectores.values():
             for i in indices:
                 for j in indices:
                     if i != j:
                         correlacion[i, j] = np.random.uniform(0.4, 0.8)
         
-        
+        # Correlaciones cruzadas más bajas
         for i in range(n_activos):
             for j in range(n_activos):
                 if correlacion[i, j] == 0:
                     correlacion[i, j] = np.random.uniform(-0.2, 0.3)
                     correlacion[j, i] = correlacion[i, j]
         
-        
+        # Proyección a matriz de correlación válida
         eigenvals, eigenvecs = np.linalg.eigh(correlacion)
         eigenvals = np.maximum(eigenvals, 0.01)
         correlacion = eigenvecs @ np.diag(eigenvals) @ eigenvecs.T
         D = np.sqrt(np.diag(correlacion))
         correlacion = correlacion / np.outer(D, D)
         
-        
+        # Config (si no se pasó una específica)
         config = ConfiguracionMonteCarlo(activos=activos) if self.config is None else self.config
         
-        
+        # Parámetros
         parametros = ParametrosFinancieros(
             precios_iniciales=precios_iniciales,
             rendimientos_esperados=rendimientos_esperados,
@@ -687,7 +687,7 @@ class SimuladorMonteCarlo:
         matriz = np.abs(correlacion)
         np.fill_diagonal(matriz, 0)
         
-        
+        # Normalizar filas para que representen "intensidad de contagio"
         row_sums = matriz.sum(axis=1)
         row_sums[row_sums == 0] = 1
         matriz = matriz / row_sums[:, np.newaxis]
@@ -698,7 +698,7 @@ class SimuladorMonteCarlo:
         shocks_modificados = shocks.copy()
         n_activos = len(shocks)
         
-        
+        # Identificar activos con shocks extremos
         activos_shock = np.abs(shocks) > self.config.umbral_shock
         
         for i in range(n_activos):
@@ -737,15 +737,15 @@ class SimuladorMonteCarlo:
         if pesos is None:
             pesos = np.ones(precios.shape[2]) / precios.shape[2]
         
-        
+        # Valor del portafolio en cada simulación y tiempo
         valor_portafolio = np.sum(precios * pesos, axis=2)
         valor_final = valor_portafolio[:, -1]
         valor_inicial = valor_portafolio[:, 0]
         
-        
+        # Rendimientos de cada simulación
         rendimientos = (valor_final - valor_inicial) / valor_inicial
         
-        
+        # Cálculo de métricas básicas de riesgo
         return {
             'rendimiento_promedio': np.mean(rendimientos),
             'volatilidad': np.std(rendimientos),
@@ -773,7 +773,7 @@ class SimuladorMonteCarlo:
                           parametros: Optional[ParametrosFinancieros] = None,
                           usar_datos_ejemplo: bool = True) -> ResultadosMonteCarlo:
       
-        
+        # Si no se pasa nada, crear datos de ejemplo
         if config is None and parametros is None and usar_datos_ejemplo:
             config, parametros = self.crear_datos_ejemplo()
         elif config is not None and parametros is None:
@@ -788,59 +788,59 @@ class SimuladorMonteCarlo:
         print(f"Simulando {len(self.config.activos)} activos")
         print(f"{self.config.n_simulaciones:,} simulaciones x {self.config.n_pasos:,} pasos")
         
-        
+        # Crear objeto Resultados
         self.resultados = ResultadosMonteCarlo(self.config, self.parametros)
         
-        
+        # Matriz de contagio a partir de la correlación
         matriz_contagio = self._crear_matriz_contagio(self.parametros.matriz_correlacion)
         self.resultados.matriz_contagio = matriz_contagio
         
-        
+        # Parámetros de tiempo
         dt = self.config.tiempo_anos / self.config.n_pasos
         n_activos = len(self.config.activos)
         
-        
+        # Descomposición de Cholesky
         L = cholesky(self.parametros.matriz_correlacion, lower=True)
         
-        
+        # Arreglos para precios y shocks
         precios = np.zeros((self.config.n_simulaciones, self.config.n_pasos + 1, n_activos))
         shocks_temporales = np.zeros((self.config.n_simulaciones, self.config.n_pasos, n_activos))
         
-        
+        # Condiciones iniciales de precios
         precios[:, 0, :] = self.parametros.precios_iniciales
         
-                
+        # Simulación
         for sim in range(self.config.n_simulaciones):
             for t in range(1, self.config.n_pasos + 1):
-                
+                # Shocks independientes
                 shocks_independientes = np.random.standard_normal(n_activos)
                 
-                
+                # Aplicar correlación
                 shocks_correlacionados = L @ shocks_independientes
                 
-                
+                # Aplicar contagio si está activado
                 if self.config.incluir_contagio:
                     shocks_finales = self._aplicar_contagio(shocks_correlacionados, matriz_contagio)
                 else:
                     shocks_finales = shocks_correlacionados
                 
-                
+                # Guardar shocks
                 shocks_temporales[sim, t-1, :] = shocks_finales
                 
-                
+                # Actualizar precios con GBM
                 drift = (self.parametros.rendimientos_esperados - 0.5 * self.parametros.volatilidades**2) * dt
                 difusion = self.parametros.volatilidades * np.sqrt(dt) * shocks_finales
                 
                 precios[sim, t, :] = precios[sim, t-1, :] * np.exp(drift + difusion)
         
-        
+        # Guardar resultados base
         self.resultados.precios_simulados = precios
         self.resultados.shocks_temporales = shocks_temporales
         
-        
+        # Detectar eventos de contagio
         self.resultados.eventos_contagio = self._detectar_eventos_contagio(shocks_temporales)
         
-        
+        # Calcular métricas de riesgo
         self.resultados.metricas_riesgo = self._calcular_metricas_riesgo(precios)
         
         print(f"Eventos de contagio detectados: {len(self.resultados.eventos_contagio)}")
@@ -885,7 +885,7 @@ class SimuladorMonteCarlo:
         
         fig, axes = plt.subplots(2, 2, figsize=(15, 10))
         
-        
+        # 1) Trayectorias del portafolio
         precios = self.resultados.precios_simulados
         pesos = np.ones(precios.shape[2]) / precios.shape[2]
         valor_portafolio = np.sum(precios * pesos, axis=2)
@@ -901,7 +901,7 @@ class SimuladorMonteCarlo:
         axes[0,0].legend()
         axes[0,0].grid(True, alpha=0.3)
         
-        
+        # 2) Distribución de rendimientos finales
         valor_final = valor_portafolio[:, -1]
         valor_inicial = valor_portafolio[:, 0]
         rendimientos = (valor_final - valor_inicial) / valor_inicial
@@ -915,13 +915,13 @@ class SimuladorMonteCarlo:
         axes[0,1].legend()
         axes[0,1].grid(True, alpha=0.3)
         
-        
+        # 3) Matriz de correlación
         corr = self.parametros.matriz_correlacion
         im = axes[1,0].imshow(corr, cmap='RdBu', vmin=-1, vmax=1)
         axes[1,0].set_title('Matriz de Correlación')
         plt.colorbar(im, ax=axes[1,0])
         
-        
+        # 4) Eventos de contagio
         if self.resultados.eventos_contagio:
             tiempos = [e['tiempo'] for e in self.resultados.eventos_contagio]
             intensidades = [e['intensidad_maxima'] for e in self.resultados.eventos_contagio]
@@ -944,12 +944,12 @@ def ejecutar_simulacion_rapida(n_simulaciones: int = 1000,
                               incluir_contagio: bool = True) -> ResultadosMonteCarlo:
     simulador = SimuladorMonteCarlo()
     
-    
+    # Crear datos de ejemplo
     config, parametros = simulador.crear_datos_ejemplo()
     config.n_simulaciones = n_simulaciones
     config.incluir_contagio = incluir_contagio
     
-    
+    # Ajustar número de activos si se desea menos
     if n_activos < 25:
         config.activos = config.activos[:n_activos]
         parametros.precios_iniciales = parametros.precios_iniciales[:n_activos]
@@ -957,13 +957,13 @@ def ejecutar_simulacion_rapida(n_simulaciones: int = 1000,
         parametros.volatilidades = parametros.volatilidades[:n_activos]
         parametros.matriz_correlacion = parametros.matriz_correlacion[:n_activos, :n_activos]
     
-    
+    # Ejecutar simulación
     resultados = simulador.ejecutar_simulacion(config=config, parametros=parametros, usar_datos_ejemplo=False)
     
     return resultados
 
 def cargar_resultados(directorio: str) -> ResultadosMonteCarlo:
-    
+    # 1) Cargar configuración y parámetros
     with open(os.path.join(directorio, 'configuracion.json'), 'r') as f:
         config_data = json.load(f)
     
@@ -976,11 +976,11 @@ def cargar_resultados(directorio: str) -> ResultadosMonteCarlo:
         matriz_correlacion=np.array(config_data['parametros']['matriz_correlacion'])
     )
     
-    
+    # 2) Inicializar objeto de resultados
     resultados = ResultadosMonteCarlo(config, parametros)
     resultados.metricas_riesgo = config_data['metricas_riesgo']
     
-    
+    # 3) Cargar simulaciones
     with open(os.path.join(directorio, 'datos_simulacion.pkl'), 'rb') as f:
         datos = pickle.load(f)
         resultados.precios_simulados = datos['precios_simulados']
