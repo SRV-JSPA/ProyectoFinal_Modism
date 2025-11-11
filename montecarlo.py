@@ -12,6 +12,10 @@ from datetime import datetime
 from dataclasses import dataclass, asdict
 import warnings
 warnings.filterwarnings('ignore')
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import LSTM, Dense, Dropout
+from sklearn.preprocessing import StandardScaler
+
 
 
 @dataclass
@@ -515,7 +519,73 @@ class ResultadosMonteCarlo:
                 'ventana_clasificacion': 21
             }
         }
-    
+    def preparar_datos_lstm(self, activo_objetivo: Optional[str] = None):
+      
+        # Usamos la lógica ya armada en componente 4
+        datos_ia = self.get_datos_componente_4()
+        series = datos_ia['series_temporales']
+
+        df_precios = series['precios']        # DataFrame (fechas x activos)
+        df_rendimientos = series['rendimientos']
+        df_volatilidad = series['volatilidad']
+
+        # Elegimos el activo objetivo
+        if activo_objetivo is None:
+            activo_objetivo = self.config.activos[0]  # por defecto el primero
+        
+        if activo_objetivo not in df_precios.columns:
+            raise ValueError(f"Activo {activo_objetivo} no encontrado en precios")
+
+        # Extraemos columnas del activo objetivo
+        precio = df_precios[activo_objetivo].values.reshape(-1, 1)
+        rendimiento = df_rendimientos[activo_objetivo].values.reshape(-1, 1)
+        volatilidad = df_volatilidad[activo_objetivo].values.reshape(-1, 1)
+
+        # Dataset de entrada: [precio, rendimiento, volatilidad]
+        dataset = np.concatenate([precio, rendimiento, volatilidad], axis=1)
+
+        # Parámetros LSTM definidos en componente 4
+        params_lstm = datos_ia['parametros_lstm']
+        lookback = int(params_lstm['secuencia_lookback'])
+        horizonte = int(params_lstm['horizonte_prediccion'])
+
+        # Escalado
+        scaler_X = StandardScaler()
+        scaler_y = StandardScaler()
+
+        X_scaled = scaler_X.fit_transform(dataset)
+        y_scaled = scaler_y.fit_transform(precio)  # target: precio futuro
+
+        # Generamos ventanas (samples)
+        X_seq = []
+        y_seq = []
+
+        # Ejemplo: predecimos el precio en t + horizonte (un solo valor)
+        for t in range(lookback, len(dataset) - horizonte):
+            X_seq.append(X_scaled[t - lookback:t, :])
+            # Precio en el horizonte
+            y_seq.append(y_scaled[t + horizonte - 1, 0])
+
+        X_seq = np.array(X_seq)              # (num_samples, lookback, num_features)
+        y_seq = np.array(y_seq).reshape(-1, 1)  # (num_samples, 1)
+
+        # Split train / test (80/20)
+        n_total = len(X_seq)
+        n_train = int(n_total * 0.8)
+
+        X_train, X_test = X_seq[:n_train], X_seq[n_train:]
+        y_train, y_test = y_seq[:n_train], y_seq[n_train:]
+
+        info = {
+            'activo_objetivo': activo_objetivo,
+            'lookback': lookback,
+            'horizonte': horizonte,
+            'scaler_X': scaler_X,
+            'scaler_y': scaler_y
+        }
+
+        return X_train, X_test, y_train, y_test, info
+
     def _calcular_features_ml(self, precios: pd.DataFrame, rendimientos: pd.DataFrame) -> pd.DataFrame:
         features = {}
         
@@ -538,7 +608,103 @@ class ResultadosMonteCarlo:
         features['momentum_21d'] = (precios / precios.shift(21) - 1).mean(axis=1)
         
         return pd.DataFrame(features).fillna(0)
-    
+    def entrenar_lstm(self,
+                      activo_objetivo: Optional[str] = None,
+                      epochs: int = 15,
+                      batch_size: int = 32,
+                      verbose: int = 1) -> Dict:
+       
+        # Preparamos datos
+        X_train, X_test, y_train, y_test, info = self.preparar_datos_lstm(activo_objetivo)
+
+        n_timesteps = X_train.shape[1]
+        n_features = X_train.shape[2]
+
+        # Definición del modelo LSTM
+        model = Sequential()
+        model.add(LSTM(64, input_shape=(n_timesteps, n_features), return_sequences=False))
+        model.add(Dropout(0.2))
+        model.add(Dense(32, activation='relu'))
+        model.add(Dense(1))  # salida: precio futuro escalado
+
+        model.compile(optimizer='adam', loss='mse')
+
+        # Entrenamiento
+        history = model.fit(
+            X_train, y_train,
+            validation_split=0.2,
+            epochs=epochs,
+            batch_size=batch_size,
+            verbose=verbose
+        )
+
+        # Evaluación en test
+        y_pred_test = model.predict(X_test)
+
+        # Desescalar para tener métricas en términos de precios
+        scaler_y = info['scaler_y']
+        y_test_inv = scaler_y.inverse_transform(y_test)
+        y_pred_inv = scaler_y.inverse_transform(y_pred_test)
+
+        # Métricas simples
+        mse = np.mean((y_test_inv - y_pred_inv) ** 2)
+        rmse = float(np.sqrt(mse))
+        mae = float(np.mean(np.abs(y_test_inv - y_pred_inv)))
+
+        metrics = {
+            'rmse': rmse,
+            'mae': mae,
+            'num_train_samples': int(X_train.shape[0]),
+            'num_test_samples': int(X_test.shape[0]),
+            'lookback': int(info['lookback']),
+            'horizonte': int(info['horizonte']),
+            'activo_objetivo': info['activo_objetivo']
+        }
+
+        # Guardamos por si lo quieres usar luego
+        self.modelo_lstm = model
+        self.datos_lstm = {
+            'X_train': X_train,
+            'X_test': X_test,
+            'y_train': y_train,
+            'y_test': y_test,
+            'y_test_inv': y_test_inv,
+            'y_pred_inv': y_pred_inv,
+            'info': info,
+            'history': history.history,
+            'metrics': metrics
+        }
+
+        print(f"\nLSTM entrenado para activo {info['activo_objetivo']}")
+        print(f"RMSE (precio): {rmse:.4f}")
+        print(f"MAE (precio):  {mae:.4f}")
+
+        return {
+            'modelo': model,
+            'metrics': metrics,
+            'history': history.history
+        }
+    def graficar_predicciones_lstm(self, n_puntos: int = 100):
+        if not hasattr(self, 'datos_lstm'):
+            print("Primero entrena el LSTM con entrenar_lstm().")
+            return
+
+        y_test = self.datos_lstm['y_test_inv'].flatten()
+        y_pred = self.datos_lstm['y_pred_inv'].flatten()
+
+        n = min(n_puntos, len(y_test))
+
+        plt.figure(figsize=(10, 5))
+        plt.plot(y_test[:n], label='Real', linewidth=2)
+        plt.plot(y_pred[:n], label='Predicho', linewidth=2, linestyle='--')
+        plt.title(f"Predicción LSTM - activo {self.datos_lstm['info']['activo_objetivo']}")
+        plt.xlabel("Muestra (test)")
+        plt.ylabel("Precio futuro")
+        plt.grid(True, alpha=0.3)
+        plt.legend()
+        plt.tight_layout()
+        plt.show()
+
     def _calcular_rsi(self, precios: pd.DataFrame, periodo: int = 14) -> pd.DataFrame:
         delta = precios.diff()
         ganancia = delta.where(delta > 0, 0)
@@ -1008,3 +1174,7 @@ if __name__ == "__main__":
     directorio = resultados.guardar_resultados()
     
     simulador.visualizar_resultados()
+    
+    resultados_lstm = resultados.entrenar_lstm(activo_objetivo=None, epochs=10, batch_size=32, verbose=1)
+
+    resultados.graficar_predicciones_lstm(n_puntos=80)
